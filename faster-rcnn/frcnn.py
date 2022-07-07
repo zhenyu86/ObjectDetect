@@ -1,29 +1,25 @@
 import colorsys
 import os
 import time
-import warnings
 
 import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
+import torch.nn as nn
 from PIL import Image, ImageDraw, ImageFont
 
-from nets.ssd import SSD300
-from utils.anchors import get_anchors
-from utils.utils import (cvtColor, get_classes, preprocess_input, resize_image,
-                         show_config)
-from utils.utils_bbox import BBoxUtility
-
-warnings.filterwarnings("ignore")
+from nets.frcnn import FasterRCNN
+from utils.utils import (cvtColor, get_classes, get_new_img_size, resize_image,
+                         preprocess_input, show_config)
+from utils.utils_bbox import DecodeBox
 
 #--------------------------------------------#
-#   使用自己训练好的模型预测需要修改3个参数
-#   model_path、backbone和classes_path都需要修改！
+#   使用自己训练好的模型预测需要修改2个参数
+#   model_path和classes_path都需要修改！
 #   如果出现shape不匹配
-#   一定要注意训练时的config里面的num_classes、
+#   一定要注意训练时的NUM_CLASSES、
 #   model_path和classes_path参数的修改
 #--------------------------------------------#
-class SSD(object):
+class FRCNN(object):
     _defaults = {
         #--------------------------------------------------------------------------#
         #   使用自己训练好的模型进行预测一定要修改model_path和classes_path！
@@ -33,43 +29,33 @@ class SSD(object):
         #   验证集损失较低不代表mAP较高，仅代表该权值在验证集上泛化性能较好。
         #   如果出现shape不匹配，同时要注意训练时的model_path和classes_path参数的修改
         #--------------------------------------------------------------------------#
-        # "model_path"        : 'model_data/ssd_weights.pth',
-        # "classes_path"      : 'model_data/voc_classes_back.txt',
-        "classes_path"        :'model_data/voc_classes.txt',
-        # "model_path"        : '/home/goldsun/桌面/证件照检测项目/models/ssd_models/ssd_weights.pth',
-        "model_path"        : '/home/goldsun/桌面/证件照检测项目/ssd-pytorch-master/logs/best_epoch_weights.pth',
-
+        # "model_path"    : 'model_data/voc_weights_resnet.pth',
+        # "classes_path"  : 'model_data/voc_classes.txt',
+        # --------------------------------------------------------------------------#
+        "model_path": '/home/goldsun/桌面/证件照检测项目/models/fasterrcnn_models/voc_weights_resnet.pth',
+        # "model_path": 'best_epoch_weights.pth',
+        "classes_path": 'model_data/voc_classes.txt',
         #---------------------------------------------------------------------#
-        #   用于预测的图像大小，和train时使用同一个即可
+        #   网络的主干特征提取网络，resnet50或者vgg
         #---------------------------------------------------------------------#
-        "input_shape"       : [300, 300],
-        #-------------------------------#
-        #   主干网络的选择
-        #   vgg或者mobilenetv2
-        #-------------------------------#
-        "backbone"          : "vgg",
+        "backbone"      : "resnet50",
         #---------------------------------------------------------------------#
         #   只有得分大于置信度的预测框会被保留下来
         #---------------------------------------------------------------------#
-        "confidence"        : 0.5,
+        "confidence"    : 0.5,
         #---------------------------------------------------------------------#
         #   非极大抑制所用到的nms_iou大小
         #---------------------------------------------------------------------#
-        "nms_iou"           : 0.45,
+        "nms_iou"       : 0.3,
         #---------------------------------------------------------------------#
         #   用于指定先验框的大小
         #---------------------------------------------------------------------#
-        'anchors_size'      : [30, 60, 111, 162, 213, 264, 315],
-        #---------------------------------------------------------------------#
-        #   该变量用于控制是否使用letterbox_image对输入图像进行不失真的resize，
-        #   在多次测试后，发现关闭letterbox_image直接resize的效果更好
-        #---------------------------------------------------------------------#
-        "letterbox_image"   : False,
+        'anchors_size'  : [8, 16, 32],
         #-------------------------------#
         #   是否使用Cuda
         #   没有GPU可以设置成False
         #-------------------------------#
-        "cuda"              : True,
+        "cuda"          : True,
     }
 
     @classmethod
@@ -80,50 +66,49 @@ class SSD(object):
             return "Unrecognized attribute name '" + n + "'"
 
     #---------------------------------------------------#
-    #   初始化ssd
+    #   初始化faster RCNN
     #---------------------------------------------------#
     def __init__(self, **kwargs):
         self.__dict__.update(self._defaults)
         for name, value in kwargs.items():
             setattr(self, name, value)
         #---------------------------------------------------#
-        #   计算总的类的数量
+        #   获得种类和先验框的数量
         #---------------------------------------------------#
         self.class_names, self.num_classes  = get_classes(self.classes_path)
-        self.anchors                        = torch.from_numpy(get_anchors(self.input_shape, self.anchors_size, self.backbone)).type(torch.FloatTensor)
+
+        self.std    = torch.Tensor([0.1, 0.1, 0.2, 0.2]).repeat(self.num_classes + 1)[None]
         if self.cuda:
-            self.anchors = self.anchors.cuda()
-        self.num_classes                    = self.num_classes + 1
-        
+            self.std    = self.std.cuda()
+        self.bbox_util  = DecodeBox(self.std, self.num_classes)
+
         #---------------------------------------------------#
         #   画框设置不同的颜色
         #---------------------------------------------------#
         hsv_tuples = [(x / self.num_classes, 1., 1.) for x in range(self.num_classes)]
         self.colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
         self.colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), self.colors))
-
-        self.bbox_util = BBoxUtility(self.num_classes)
         self.generate()
-        
+
         show_config(**self._defaults)
 
     #---------------------------------------------------#
     #   载入模型
     #---------------------------------------------------#
-    def generate(self, onnx=False):
+    def generate(self):
         #-------------------------------#
         #   载入模型与权值
         #-------------------------------#
-        self.net    = SSD300(self.num_classes, self.backbone)
+        self.net    = FasterRCNN(self.num_classes, "predict", anchor_scales = self.anchors_size, backbone = self.backbone)
         device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.load_state_dict(torch.load(self.model_path, map_location=device))
         self.net    = self.net.eval()
         print('{} model, anchors, and classes loaded.'.format(self.model_path))
-        if not onnx:
-            if self.cuda:
-                self.net = torch.nn.DataParallel(self.net)
-                self.net = self.net.cuda()
-
+        
+        if self.cuda:
+            self.net = nn.DataParallel(self.net)
+            self.net = self.net.cuda()
+    
     #---------------------------------------------------#
     #   检测图片
     #---------------------------------------------------#
@@ -132,51 +117,55 @@ class SSD(object):
         #   计算输入图片的高和宽
         #---------------------------------------------------#
         image_shape = np.array(np.shape(image)[0:2])
+        #---------------------------------------------------#
+        #   计算resize后的图片的大小，resize后的图片短边为600
+        #---------------------------------------------------#
+        input_shape = get_new_img_size(image_shape[0], image_shape[1])
         #---------------------------------------------------------#
         #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
         #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
         #---------------------------------------------------------#
         image       = cvtColor(image)
         #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
+        #   给原图像进行resize，resize到短边为600的大小上
         #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
+        image_data  = resize_image(image, [input_shape[1], input_shape[0]])
         #---------------------------------------------------------#
-        #   添加上batch_size维度，图片预处理，归一化。
+        #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
 
         with torch.no_grad():
-            #---------------------------------------------------#
-            #   转化成torch的形式
-            #---------------------------------------------------#
-            images = torch.from_numpy(image_data).type(torch.FloatTensor)
+            images = torch.from_numpy(image_data)
             if self.cuda:
                 images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs     = self.net(images)
-            #-----------------------------------------------------------#
-            #   将预测结果进行解码
-            #-----------------------------------------------------------#
-            results     = self.bbox_util.decode_box(outputs, self.anchors, image_shape, self.input_shape, self.letterbox_image, 
+            
+            #-------------------------------------------------------------#
+            #   roi_cls_locs  建议框的调整参数
+            #   roi_scores    建议框的种类得分
+            #   rois          建议框的坐标
+            #-------------------------------------------------------------#
+            roi_cls_locs, roi_scores, rois, _ = self.net(images)
+            #-------------------------------------------------------------#
+            #   利用classifier的预测结果对建议框进行解码，获得预测框
+            #-------------------------------------------------------------#
+            results = self.bbox_util.forward(roi_cls_locs, roi_scores, rois, image_shape, input_shape, 
                                                     nms_iou = self.nms_iou, confidence = self.confidence)
-            #--------------------------------------#
-            #   如果没有检测到物体，则返回原图
-            #--------------------------------------#
+            #---------------------------------------------------------#
+            #   如果没有检测出物体，返回原图
+            #---------------------------------------------------------#           
             if len(results[0]) <= 0:
                 return image
-
-            top_label   = np.array(results[0][:, 4], dtype = 'int32')
-            top_conf    = results[0][:, 5]
+                
+            top_label   = np.array(results[0][:, 5], dtype = 'int32')
+            top_conf    = results[0][:, 4]
             top_boxes   = results[0][:, :4]
+        
         #---------------------------------------------------------#
         #   设置字体与边框厚度
         #---------------------------------------------------------#
-        font = ImageFont.truetype(font='model_data/simhei.ttf', size=np.floor(3e-2 * np.shape(image)[1] + 0.5).astype('int32'))
-        thickness = max((np.shape(image)[0] + np.shape(image)[1]) // self.input_shape[0], 1)
+        font        = ImageFont.truetype(font='model_data/simhei.ttf', size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
+        thickness   = int(max((image.size[0] + image.size[1]) // np.mean(input_shape), 1))
         #---------------------------------------------------------#
         #   计数
         #---------------------------------------------------------#
@@ -193,7 +182,7 @@ class SSD(object):
         #   是否进行目标的裁剪
         #---------------------------------------------------------#
         if crop:
-            for i, c in list(enumerate(top_boxes)):
+            for i, c in list(enumerate(top_label)):
                 top, left, bottom, right = top_boxes[i]
                 top     = max(0, np.floor(top).astype('int32'))
                 left    = max(0, np.floor(left).astype('int32'))
@@ -225,7 +214,7 @@ class SSD(object):
             draw = ImageDraw.Draw(image)
             label_size = draw.textsize(label, font)
             label = label.encode('utf-8')
-            print(label, top, left, bottom, right)
+            # print(label, top, left, bottom, right)
             
             if top - label_size[1] >= 0:
                 text_origin = np.array([left, top - label_size[1]])
@@ -245,129 +234,82 @@ class SSD(object):
         #   计算输入图片的高和宽
         #---------------------------------------------------#
         image_shape = np.array(np.shape(image)[0:2])
+        input_shape = get_new_img_size(image_shape[0], image_shape[1])
         #---------------------------------------------------------#
         #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
         #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
         #---------------------------------------------------------#
         image       = cvtColor(image)
+        
         #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
+        #   给原图像进行resize，resize到短边为600的大小上
         #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
+        image_data  = resize_image(image, [input_shape[1], input_shape[0]])
         #---------------------------------------------------------#
-        #   添加上batch_size维度，图片预处理，归一化。
+        #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
 
         with torch.no_grad():
-            #---------------------------------------------------#
-            #   转化成torch的形式
-            #---------------------------------------------------#
-            images = torch.from_numpy(image_data).type(torch.FloatTensor)
+            images = torch.from_numpy(image_data)
             if self.cuda:
                 images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs     = self.net(images)
-            #-----------------------------------------------------------#
-            #   将预测结果进行解码
-            #-----------------------------------------------------------#
-            results     = self.bbox_util.decode_box(outputs, self.anchors, image_shape, self.input_shape, self.letterbox_image, 
-                                                    nms_iou = self.nms_iou, confidence = self.confidence)
 
+            roi_cls_locs, roi_scores, rois, _ = self.net(images)
+            #-------------------------------------------------------------#
+            #   利用classifier的预测结果对建议框进行解码，获得预测框
+            #-------------------------------------------------------------#
+            results = self.bbox_util.forward(roi_cls_locs, roi_scores, rois, image_shape, input_shape, 
+                                                    nms_iou = self.nms_iou, confidence = self.confidence)
         t1 = time.time()
         for _ in range(test_interval):
             with torch.no_grad():
-                #---------------------------------------------------------#
-                #   将图像输入网络当中进行预测！
-                #---------------------------------------------------------#
-                outputs     = self.net(images)
-                #-----------------------------------------------------------#
-                #   将预测结果进行解码
-                #-----------------------------------------------------------#
-                results     = self.bbox_util.decode_box(outputs, self.anchors, image_shape, self.input_shape, self.letterbox_image, 
+                roi_cls_locs, roi_scores, rois, _ = self.net(images)
+                #-------------------------------------------------------------#
+                #   利用classifier的预测结果对建议框进行解码，获得预测框
+                #-------------------------------------------------------------#
+                results = self.bbox_util.forward(roi_cls_locs, roi_scores, rois, image_shape, input_shape, 
                                                         nms_iou = self.nms_iou, confidence = self.confidence)
-
+                
         t2 = time.time()
         tact_time = (t2 - t1) / test_interval
         return tact_time
 
-    def convert_to_onnx(self, simplify, model_path):
-        import onnx
-        self.generate(onnx=True)
-
-        im                  = torch.zeros(1, 3, *self.input_shape).to('cpu')  # image size(1, 3, 512, 512) BCHW
-        input_layer_names   = ["images"]
-        output_layer_names  = ["output"]
-        
-        # Export the model
-        print(f'Starting export with onnx {onnx.__version__}.')
-        torch.onnx.export(self.net,
-                        im,
-                        f               = model_path,
-                        verbose         = False,
-                        opset_version   = 12,
-                        training        = torch.onnx.TrainingMode.EVAL,
-                        do_constant_folding = True,
-                        input_names     = input_layer_names,
-                        output_names    = output_layer_names,
-                        dynamic_axes    = None)
-
-        # Checks
-        model_onnx = onnx.load(model_path)  # load onnx model
-        onnx.checker.check_model(model_onnx)  # check onnx model
-
-        # Simplify onnx
-        if simplify:
-            import onnxsim
-            print(f'Simplifying with onnx-simplifier {onnxsim.__version__}.')
-            model_onnx, check = onnxsim.simplify(
-                model_onnx,
-                dynamic_input_shape=False,
-                input_shapes=None)
-            assert check, 'assert check failed'
-            onnx.save(model_onnx, model_path)
-
-        print('Onnx model save as {}'.format(model_path))
-    
+    #---------------------------------------------------#
+    #   检测图片
+    #---------------------------------------------------#
     def get_map_txt(self, image_id, image, class_names, map_out_path):
-        f = open(os.path.join(map_out_path, "detection-results/"+image_id+".txt"),"w") 
+        f = open(os.path.join(map_out_path, "detection-results/"+image_id+".txt"),"w")
         #---------------------------------------------------#
         #   计算输入图片的高和宽
         #---------------------------------------------------#
         image_shape = np.array(np.shape(image)[0:2])
+        input_shape = get_new_img_size(image_shape[0], image_shape[1])
         #---------------------------------------------------------#
         #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
         #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
         #---------------------------------------------------------#
         image       = cvtColor(image)
+        
         #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
+        #   给原图像进行resize，resize到短边为600的大小上
         #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
+        image_data  = resize_image(image, [input_shape[1], input_shape[0]])
         #---------------------------------------------------------#
-        #   添加上batch_size维度，图片预处理，归一化。
+        #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
 
         with torch.no_grad():
-            #---------------------------------------------------#
-            #   转化成torch的形式
-            #---------------------------------------------------#
-            images = torch.from_numpy(image_data).type(torch.FloatTensor)
+            images = torch.from_numpy(image_data)
             if self.cuda:
                 images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs     = self.net(images)
-            #-----------------------------------------------------------#
-            #   将预测结果进行解码
-            #-----------------------------------------------------------#
-            results     = self.bbox_util.decode_box(outputs, self.anchors, image_shape, self.input_shape, self.letterbox_image, 
+
+            roi_cls_locs, roi_scores, rois, _ = self.net(images)
+            #-------------------------------------------------------------#
+            #   利用classifier的预测结果对建议框进行解码，获得预测框
+            #-------------------------------------------------------------#
+            results = self.bbox_util.forward(roi_cls_locs, roi_scores, rois, image_shape, input_shape, 
                                                     nms_iou = self.nms_iou, confidence = self.confidence)
             #--------------------------------------#
             #   如果没有检测到物体，则返回原图
@@ -375,8 +317,8 @@ class SSD(object):
             if len(results[0]) <= 0:
                 return 
 
-            top_label   = np.array(results[0][:, 4], dtype = 'int32')
-            top_conf    = results[0][:, 5]
+            top_label   = np.array(results[0][:, 5], dtype = 'int32')
+            top_conf    = results[0][:, 4]
             top_boxes   = results[0][:, :4]
         
         for i, c in list(enumerate(top_label)):

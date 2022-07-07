@@ -1,22 +1,21 @@
-import datetime
 import os
 
-import torch
 import matplotlib
+import torch
+
 matplotlib.use('Agg')
-import scipy.signal
 from matplotlib import pyplot as plt
-from torch.utils.tensorboard import SummaryWriter
+import scipy.signal
 
 import shutil
 import numpy as np
-
 from PIL import Image
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from .utils import cvtColor, preprocess_input, resize_image
-from .utils_bbox import BBoxUtility
-from .utils_map import get_coco_map, get_map
 
+from .utils import cvtColor, resize_image, preprocess_input, get_new_img_size
+from .utils_bbox import DecodeBox
+from .utils_map import get_coco_map, get_map
 
 class LossHistory():
     def __init__(self, log_dir, model, input_shape):
@@ -26,11 +25,11 @@ class LossHistory():
         
         os.makedirs(self.log_dir)
         self.writer     = SummaryWriter(self.log_dir)
-        try:
-            dummy_input     = torch.randn(2, 3, input_shape[0], input_shape[1])
-            self.writer.add_graph(model, dummy_input)
-        except:
-            pass
+        # try:
+        #     dummy_input     = torch.randn(2, 3, input_shape[0], input_shape[1])
+        #     self.writer.add_graph(model, dummy_input)
+        # except:
+        #     pass
 
     def append_loss(self, epoch, loss, val_loss):
         if not os.path.exists(self.log_dir):
@@ -78,13 +77,12 @@ class LossHistory():
         plt.close("all")
 
 class EvalCallback():
-    def __init__(self, net, input_shape, anchors, class_names, num_classes, val_lines, log_dir, cuda, \
+    def __init__(self, net, input_shape, class_names, num_classes, val_lines, log_dir, cuda, \
             map_out_path=".temp_map_out", max_boxes=100, confidence=0.05, nms_iou=0.5, letterbox_image=True, MINOVERLAP=0.5, eval_flag=True, period=1):
         super(EvalCallback, self).__init__()
         
         self.net                = net
         self.input_shape        = input_shape
-        self.anchors            = anchors
         self.class_names        = class_names
         self.num_classes        = num_classes
         self.val_lines          = val_lines
@@ -99,12 +97,11 @@ class EvalCallback():
         self.eval_flag          = eval_flag
         self.period             = period
         
-        self.anchors            = torch.from_numpy(self.anchors).type(torch.FloatTensor)
+        self.std    = torch.Tensor([0.1, 0.1, 0.2, 0.2]).repeat(self.num_classes + 1)[None]
         if self.cuda:
-            self.anchors = self.anchors.cuda()
-        
-        self.bbox_util = BBoxUtility(self.num_classes)
-        
+            self.std    = self.std.cuda()
+        self.bbox_util  = DecodeBox(self.std, self.num_classes)
+
         self.maps       = [0]
         self.epoches    = [0]
         if self.eval_flag:
@@ -112,42 +109,41 @@ class EvalCallback():
                 f.write(str(0))
                 f.write("\n")
 
+    #---------------------------------------------------#
+    #   检测图片
+    #---------------------------------------------------#
     def get_map_txt(self, image_id, image, class_names, map_out_path):
-        f = open(os.path.join(map_out_path, "detection-results/"+image_id+".txt"),"w") 
+        f = open(os.path.join(map_out_path, "detection-results/"+image_id+".txt"),"w")
         #---------------------------------------------------#
         #   计算输入图片的高和宽
         #---------------------------------------------------#
         image_shape = np.array(np.shape(image)[0:2])
+        input_shape = get_new_img_size(image_shape[0], image_shape[1])
         #---------------------------------------------------------#
         #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
         #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
         #---------------------------------------------------------#
         image       = cvtColor(image)
+        
         #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
+        #   给原图像进行resize，resize到短边为600的大小上
         #---------------------------------------------------------#
-        image_data  = resize_image(image, (self.input_shape[1], self.input_shape[0]), self.letterbox_image)
+        image_data  = resize_image(image, [input_shape[1], input_shape[0]])
         #---------------------------------------------------------#
-        #   添加上batch_size维度，图片预处理，归一化。
+        #   添加上batch_size维度
         #---------------------------------------------------------#
-        image_data = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
+        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, dtype='float32')), (2, 0, 1)), 0)
 
         with torch.no_grad():
-            #---------------------------------------------------#
-            #   转化成torch的形式
-            #---------------------------------------------------#
-            images = torch.from_numpy(image_data).type(torch.FloatTensor)
+            images = torch.from_numpy(image_data)
             if self.cuda:
                 images = images.cuda()
-            #---------------------------------------------------------#
-            #   将图像输入网络当中进行预测！
-            #---------------------------------------------------------#
-            outputs     = self.net(images)
-            #-----------------------------------------------------------#
-            #   将预测结果进行解码
-            #-----------------------------------------------------------#
-            results     = self.bbox_util.decode_box(outputs, self.anchors, image_shape, self.input_shape, self.letterbox_image, 
+
+            roi_cls_locs, roi_scores, rois, _ = self.net(images)
+            #-------------------------------------------------------------#
+            #   利用classifier的预测结果对建议框进行解码，获得预测框
+            #-------------------------------------------------------------#
+            results = self.bbox_util.forward(roi_cls_locs, roi_scores, rois, image_shape, input_shape, 
                                                     nms_iou = self.nms_iou, confidence = self.confidence)
             #--------------------------------------#
             #   如果没有检测到物体，则返回原图
@@ -155,8 +151,8 @@ class EvalCallback():
             if len(results[0]) <= 0:
                 return 
 
-            top_label   = np.array(results[0][:, 4], dtype = 'int32')
-            top_conf    = results[0][:, 5]
+            top_label   = np.array(results[0][:, 5], dtype = 'int32')
+            top_conf    = results[0][:, 4]
             top_boxes   = results[0][:, :4]
 
         top_100     = np.argsort(top_label)[::-1][:self.max_boxes]
@@ -178,9 +174,8 @@ class EvalCallback():
         f.close()
         return 
     
-    def on_epoch_end(self, epoch, model_eval):
+    def on_epoch_end(self, epoch):
         if epoch % self.period == 0 and self.eval_flag:
-            self.net = model_eval
             if not os.path.exists(self.map_out_path):
                 os.makedirs(self.map_out_path)
             if not os.path.exists(os.path.join(self.map_out_path, "ground-truth")):

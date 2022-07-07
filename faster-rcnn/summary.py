@@ -5,19 +5,18 @@ import torch
 from thop import clever_format, profile
 from torchsummary import summary
 
-from nets.ssd import SSD300
+from nets.frcnn import FasterRCNN
 
 if __name__ == "__main__":
-    input_shape = [300, 300]
-    num_classes = 21
-    backbone    = "vgg"
+    input_shape     = [600, 600]
+    num_classes     = 21
     
     device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    m       = SSD300(num_classes, backbone).to(device)
-    summary(m, (3, input_shape[0], input_shape[1]))
+    model   = FasterRCNN(num_classes, backbone = 'vgg').to(device)
+    summary(model, (3, input_shape[0], input_shape[1]))
     
     dummy_input     = torch.randn(1, 3, input_shape[0], input_shape[1]).to(device)
-    flops, params   = profile(m.to(device), (dummy_input, ), verbose=False)
+    flops, params   = profile(model.to(device), (dummy_input, ), verbose=False)
     #--------------------------------------------------------#
     #   flops * 2是因为profile没有将卷积作为两个operations
     #   有些论文将卷积算乘法、加法两个operations。此时乘2
@@ -28,4 +27,3 @@ if __name__ == "__main__":
     flops, params   = clever_format([flops, params], "%.3f")
     print('Total GFLOPS: %s' % (flops))
     print('Total params: %s' % (params))
-
