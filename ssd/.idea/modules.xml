@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/faster-rcnn-pytorch-master.iml" filepath="$PROJECT_DIR$/.idea/faster-rcnn-pytorch-master.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/ssd-pytorch-master.iml" filepath="$PROJECT_DIR$/.idea/ssd-pytorch-master.iml" />
     </modules>
   </component>
 </project>
