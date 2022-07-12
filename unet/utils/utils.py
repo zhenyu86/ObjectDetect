@@ -16,19 +16,19 @@ def cvtColor(image):
 #   对输入图像进行resize
 #---------------------------------------------------#
 def resize_image(image, size):
-    w, h        = size
-    new_image   = image.resize((w, h), Image.BICUBIC)
-    return new_image
+    iw, ih  = image.size
+    w, h    = size
 
-#---------------------------------------------------#
-#   获得类
-#---------------------------------------------------#
-def get_classes(classes_path):
-    with open(classes_path, encoding='utf-8') as f:
-        class_names = f.readlines()
-    class_names = [c.strip() for c in class_names]
-    return class_names, len(class_names)
+    scale   = min(w/iw, h/ih)
+    nw      = int(iw*scale)
+    nh      = int(ih*scale)
 
+    image   = image.resize((nw,nh), Image.BICUBIC)
+    new_image = Image.new('RGB', size, (128,128,128))
+    new_image.paste(image, ((w-nw)//2, (h-nh)//2))
+
+    return new_image, nw, nh
+    
 #---------------------------------------------------#
 #   获得学习率
 #---------------------------------------------------#
@@ -49,14 +49,16 @@ def show_config(**kwargs):
         print('|%25s | %40s|' % (str(key), str(value)))
     print('-' * 70)
 
-def get_new_img_size(height, width, img_min_side=600):
-    if width <= height:
-        f = float(img_min_side) / width
-        resized_height = int(f * height)
-        resized_width = int(img_min_side)
-    else:
-        f = float(img_min_side) / height
-        resized_width = int(f * width)
-        resized_height = int(img_min_side)
-
-    return resized_height, resized_width
+def download_weights(backbone, model_dir="./model_data"):
+    import os
+    from torch.hub import load_state_dict_from_url
+    
+    download_urls = {
+        'vgg'       : 'https://download.pytorch.org/models/vgg16-397923af.pth',
+        'resnet50'  : 'https://s3.amazonaws.com/pytorch/models/resnet50-19c8e357.pth'
+    }
+    url = download_urls[backbone]
+    
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    load_state_dict_from_url(url, model_dir)
